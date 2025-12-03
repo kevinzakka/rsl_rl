@@ -32,6 +32,7 @@ class ActorCriticCNN(ActorCritic):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        shared_cnn_backbone: bool = False,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -79,8 +80,41 @@ class ActorCriticCNN(ActorCritic):
             "No 2D observations are provided. If this is intentional, use the ActorCritic module instead."
         )
 
+        # Shared CNN.
+        self.shared_cnn_backbone = shared_cnn_backbone
+        if self.shared_cnn_backbone and self.actor_obs_groups_2d:
+            assert actor_cnn_cfg is not None, "A CNN configuration is required for 2D observations."
+            shared_cnn_cfg: dict[str, dict[str, Any]]
+            if not all(isinstance(v, dict) for v in actor_cnn_cfg.values()):
+                shared_cnn_cfg = {group: actor_cnn_cfg for group in self.actor_obs_groups_2d}
+            else:
+                shared_cnn_cfg = actor_cnn_cfg
+            assert len(shared_cnn_cfg) == len(self.actor_obs_groups_2d), (
+                "The number of CNN configurations must match the number of 2D observations."
+            )
+
+            # Create shared CNNs for each 2D observation.
+            self.shared_cnns = nn.ModuleDict()
+            encoding_dim = 0
+            for idx, obs_group in enumerate(self.actor_obs_groups_2d):
+                self.shared_cnns[obs_group] = CNN(
+                    input_dim=actor_in_dims_2d[idx],
+                    input_channels=actor_in_channels_2d[idx],
+                    **shared_cnn_cfg[obs_group],
+                )
+                print(f"Shared CNN for {obs_group}: {self.shared_cnns[obs_group]}")
+                if self.shared_cnns[obs_group].output_channels is None:
+                    encoding_dim += int(self.shared_cnns[obs_group].output_dim)
+                else:
+                    raise ValueError("The output of the shared CNN must be flattened before passing it to the MLP.")
+
+            # Use the same encoding dimension for both actor and critic.
+            actor_encoding_dim = encoding_dim
+            critic_encoding_dim = encoding_dim
+            self.actor_cnns = None
+            self.critic_cnns = None
         # Actor CNN
-        if self.actor_obs_groups_2d:
+        elif self.actor_obs_groups_2d:
             # Resolve the actor CNN configuration
             assert actor_cnn_cfg is not None, "An actor CNN configuration is required for 2D actor observations."
             # If a single configuration dictionary is provided, create a dictionary for each 2D observation group
@@ -93,7 +127,7 @@ class ActorCriticCNN(ActorCritic):
 
             # Create CNNs for each 2D actor observation
             self.actor_cnns = nn.ModuleDict()
-            encoding_dim = 0
+            actor_encoding_dim = 0
             for idx, obs_group in enumerate(self.actor_obs_groups_2d):
                 self.actor_cnns[obs_group] = CNN(
                     input_dim=actor_in_dims_2d[idx],
@@ -103,19 +137,19 @@ class ActorCriticCNN(ActorCritic):
                 print(f"Actor CNN for {obs_group}: {self.actor_cnns[obs_group]}")
                 # Get the output dimension of the CNN
                 if self.actor_cnns[obs_group].output_channels is None:
-                    encoding_dim += int(self.actor_cnns[obs_group].output_dim)
+                    actor_encoding_dim += int(self.actor_cnns[obs_group].output_dim)
                 else:
                     raise ValueError("The output of the actor CNN must be flattened before passing it to the MLP.")
         else:
             self.actor_cnns = None
-            encoding_dim = 0
+            actor_encoding_dim = 0
 
         # Actor MLP
         self.state_dependent_std = state_dependent_std
         if self.state_dependent_std:
-            self.actor = MLP(num_actor_obs_1d + encoding_dim, [2, num_actions], actor_hidden_dims, activation)
+            self.actor = MLP(num_actor_obs_1d + actor_encoding_dim, [2, num_actions], actor_hidden_dims, activation)
         else:
-            self.actor = MLP(num_actor_obs_1d + encoding_dim, num_actions, actor_hidden_dims, activation)
+            self.actor = MLP(num_actor_obs_1d + actor_encoding_dim, num_actions, actor_hidden_dims, activation)
         print(f"Actor MLP: {self.actor}")
 
         # Actor observation normalization (only for 1D actor observations)
@@ -139,7 +173,7 @@ class ActorCriticCNN(ActorCritic):
 
             # Create CNNs for each 2D critic observation
             self.critic_cnns = nn.ModuleDict()
-            encoding_dim = 0
+            critic_encoding_dim = 0
             for idx, obs_group in enumerate(self.critic_obs_groups_2d):
                 self.critic_cnns[obs_group] = CNN(
                     input_dim=critic_in_dims_2d[idx],
@@ -149,15 +183,15 @@ class ActorCriticCNN(ActorCritic):
                 print(f"Critic CNN for {obs_group}: {self.critic_cnns[obs_group]}")
                 # Get the output dimension of the CNN
                 if self.critic_cnns[obs_group].output_channels is None:
-                    encoding_dim += int(self.critic_cnns[obs_group].output_dim)
+                    critic_encoding_dim += int(self.critic_cnns[obs_group].output_dim)
                 else:
                     raise ValueError("The output of the critic CNN must be flattened before passing it to the MLP.")
         else:
             self.critic_cnns = None
-            encoding_dim = 0
+            critic_encoding_dim = 0
 
         # Critic MLP
-        self.critic = MLP(num_critic_obs_1d + encoding_dim, 1, critic_hidden_dims, activation)
+        self.critic = MLP(num_critic_obs_1d + critic_encoding_dim, 1, critic_hidden_dims, activation)
         print(f"Critic MLP: {self.critic}")
 
         # Critic observation normalization (only for 1D critic observations)
@@ -195,7 +229,13 @@ class ActorCriticCNN(ActorCritic):
         Normal.set_default_validate_args(False)
 
     def _update_distribution(self, mlp_obs: torch.Tensor, cnn_obs: dict[str, torch.Tensor]) -> None:
-        if self.actor_cnns is not None:
+        if self.shared_cnn_backbone:
+            # Encode the 2D observations using shared CNNs
+            cnn_enc_list = [self.shared_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.actor_obs_groups_2d]
+            cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+            # Concatenate to the MLP observations
+            mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
+        elif self.actor_cnns is not None:
             # Encode the 2D actor observations
             cnn_enc_list = [self.actor_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.actor_obs_groups_2d]
             cnn_enc = torch.cat(cnn_enc_list, dim=-1)
@@ -214,7 +254,13 @@ class ActorCriticCNN(ActorCritic):
         mlp_obs, cnn_obs = self.get_actor_obs(obs)
         mlp_obs = self.actor_obs_normalizer(mlp_obs)
 
-        if self.actor_cnns is not None:
+        if self.shared_cnn_backbone:
+            # Encode the 2D observations using shared CNNs
+            cnn_enc_list = [self.shared_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.actor_obs_groups_2d]
+            cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+            # Concatenate to the MLP observations
+            mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
+        elif self.actor_cnns is not None:
             # Encode the 2D actor observations
             cnn_enc_list = [self.actor_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.actor_obs_groups_2d]
             cnn_enc = torch.cat(cnn_enc_list, dim=-1)
@@ -230,7 +276,13 @@ class ActorCriticCNN(ActorCritic):
         mlp_obs, cnn_obs = self.get_critic_obs(obs)
         mlp_obs = self.critic_obs_normalizer(mlp_obs)
 
-        if self.critic_cnns is not None:
+        if self.shared_cnn_backbone:
+            # Encode the 2D observations using shared CNNs
+            cnn_enc_list = [self.shared_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.critic_obs_groups_2d]
+            cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+            # Concatenate to the MLP observations
+            mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
+        elif self.critic_cnns is not None:
             # Encode the 2D critic observations
             cnn_enc_list = [self.critic_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.critic_obs_groups_2d]
             cnn_enc = torch.cat(cnn_enc_list, dim=-1)
