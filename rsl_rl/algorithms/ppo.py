@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
@@ -15,6 +16,67 @@ from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable
+
+
+def project_distribution(
+    next_probs: torch.Tensor,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    gamma: float,
+    atoms: torch.Tensor,
+    v_min: float,
+    v_max: float,
+) -> torch.Tensor:
+    """Project r + γZ onto fixed atom support (C51 projection).
+
+    This function implements the categorical projection from the C51 paper. When computing
+    the Bellman update T_z = r + γZ(s'), the resulting atoms may not align with the fixed
+    support. This function distributes the probability mass onto neighboring atoms.
+
+    Args:
+        next_probs: Probabilities of next state distribution [batch, num_atoms].
+        rewards: Immediate rewards [batch] or [batch, 1].
+        dones: Terminal flags [batch] or [batch, 1].
+        gamma: Discount factor.
+        atoms: Atom values [num_atoms].
+        v_min: Minimum value of the support.
+        v_max: Maximum value of the support.
+
+    Returns:
+        target_probs: Projected target distribution [batch, num_atoms].
+    """
+    device = next_probs.device
+    batch_size = next_probs.shape[0]
+    num_atoms = atoms.shape[0]
+    delta_z = (v_max - v_min) / (num_atoms - 1)
+
+    # Flatten rewards and dones if needed
+    rewards = rewards.view(-1)
+    dones = dones.view(-1)
+
+    # Compute target atoms: T_z = r + γ * z (0 if terminal)
+    not_done = (1 - dones.float()).unsqueeze(-1)
+    target_atoms = rewards.unsqueeze(-1) + not_done * gamma * atoms.unsqueeze(0)
+    target_atoms = target_atoms.clamp(v_min, v_max)
+
+    # Compute projection indices
+    b = (target_atoms - v_min) / delta_z  # Fractional index [batch, num_atoms]
+    l = b.floor().long().clamp(0, num_atoms - 1)
+    u = b.ceil().long().clamp(0, num_atoms - 1)
+
+    # Distribute probability mass to neighboring atoms
+    target_probs = torch.zeros(batch_size, num_atoms, device=device)
+
+    # Weight for lower and upper atoms
+    w_l = u.float() - b  # Weight for lower atom
+    w_u = b - l.float()  # Weight for upper atom
+
+    # Scatter probabilities
+    for i in range(num_atoms):
+        target_probs.scatter_add_(1, l[:, i : i + 1], next_probs[:, i : i + 1] * w_l[:, i : i + 1])
+        target_probs.scatter_add_(1, u[:, i : i + 1], next_probs[:, i : i + 1] * w_u[:, i : i + 1])
+
+    return target_probs
 
 
 class PPO:
@@ -168,10 +230,18 @@ class PPO:
 
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
-        # Compute value for the last step
-        last_values = self.policy.evaluate(obs).detach()
-        # Compute returns and advantages
+        atoms = self.policy.atoms
+        v_min, v_max = self.policy.v_min, self.policy.v_max
+
+        # Compute value and distribution for the last step
+        with torch.no_grad():
+            last_values = self.policy.evaluate(obs).detach()
+            last_logits = self.policy.evaluate_dist(obs)
+            last_probs = F.softmax(last_logits, dim=-1)
+
+        # Compute returns, advantages, and target distributions
         advantage = 0
+        next_probs = last_probs
         for step in reversed(range(st.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
@@ -183,6 +253,19 @@ class PPO:
             advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
             st.returns[step] = advantage + st.values[step]
+
+            # Compute target distribution: project r + γZ(s') onto fixed support
+            target_probs = project_distribution(
+                next_probs, st.rewards[step], st.dones[step], self.gamma, atoms, v_min, v_max
+            )
+            st.target_probs[step] = target_probs
+
+            # Get current step's distribution for next iteration
+            if step > 0:
+                with torch.no_grad():
+                    logits = self.policy.evaluate_dist(st.observations[step])
+                    next_probs = F.softmax(logits, dim=-1)
+
         # Compute the advantages
         st.advantages = st.returns - st.values
         # Normalize the advantages if per minibatch normalization is not used
@@ -216,6 +299,7 @@ class PPO:
             old_sigma_batch,
             hidden_states_batch,
             masks_batch,
+            target_probs_batch,
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
@@ -242,6 +326,7 @@ class PPO:
                 target_values_batch = target_values_batch.repeat(num_aug, 1)
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
+                target_probs_batch = target_probs_batch.repeat(num_aug, 1)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
@@ -297,16 +382,12 @@ class PPO:
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                    -self.clip_param, self.clip_param
-                )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+            # Value function loss (distributional cross-entropy)
+            # Get predicted distribution logits
+            value_logits = self.policy.evaluate_dist(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+            log_probs = F.log_softmax(value_logits, dim=-1)
+            # Cross-entropy loss: -Σ(target_probs * log_probs)
+            value_loss = -(target_probs_batch * log_probs).sum(dim=-1).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
@@ -403,7 +484,7 @@ class PPO:
 
         # Construct the loss dictionary
         loss_dict = {
-            "value": mean_value_loss,
+            "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }

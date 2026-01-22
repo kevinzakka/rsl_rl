@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.distributions import Normal
 from typing import Any
@@ -32,6 +33,10 @@ class ActorCriticCNN(ActorCritic):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        # Distributional critic parameters (C51-style)
+        num_atoms: int = 51,
+        v_min: float = -10.0,
+        v_max: float = 10.0,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -156,9 +161,13 @@ class ActorCriticCNN(ActorCritic):
             self.critic_cnns = None
             encoding_dim = 0
 
-        # Critic MLP
-        self.critic = MLP(num_critic_obs_1d + encoding_dim, 1, critic_hidden_dims, activation)
-        print(f"Critic MLP: {self.critic}")
+        # Distributional critic (C51-style)
+        self.num_atoms = num_atoms
+        self.v_min = v_min
+        self.v_max = v_max
+        self.register_buffer("atoms", torch.linspace(v_min, v_max, num_atoms))
+        self.critic = MLP(num_critic_obs_1d + encoding_dim, num_atoms, critic_hidden_dims, activation)
+        print(f"Critic MLP (distributional, {num_atoms} atoms): {self.critic}")
 
         # Critic observation normalization (only for 1D critic observations)
         self.critic_obs_normalization = critic_obs_normalization
@@ -227,6 +236,18 @@ class ActorCriticCNN(ActorCritic):
             return self.actor(mlp_obs)
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
+        """Evaluate the value of the given observation.
+
+        Returns the expected value from the distributional critic: E[Z] = Σ(probs × atoms).
+        This maintains backward compatibility by returning a scalar value.
+
+        Args:
+            obs: The observation tensor dict.
+            **kwargs: Additional arguments (unused, for compatibility).
+
+        Returns:
+            The expected value tensor with shape [batch, 1].
+        """
         mlp_obs, cnn_obs = self.get_critic_obs(obs)
         mlp_obs = self.critic_obs_normalizer(mlp_obs)
 
@@ -237,7 +258,32 @@ class ActorCriticCNN(ActorCritic):
             # Concatenate to the MLP observations
             mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
 
-        return self.critic(mlp_obs)
+        logits = self.critic(mlp_obs)  # [batch, num_atoms]
+        probs = F.softmax(logits, dim=-1)
+        # Expected value: E[Z] = Σ(probs × atoms)
+        return (probs * self.atoms).sum(dim=-1, keepdim=True)  # [batch, 1]
+
+    def evaluate_dist(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
+        """Return the full distribution logits for loss computation.
+
+        Args:
+            obs: The observation tensor dict.
+            **kwargs: Additional arguments (unused, for compatibility).
+
+        Returns:
+            The critic logits tensor with shape [batch, num_atoms].
+        """
+        mlp_obs, cnn_obs = self.get_critic_obs(obs)
+        mlp_obs = self.critic_obs_normalizer(mlp_obs)
+
+        if self.critic_cnns is not None:
+            # Encode the 2D critic observations
+            cnn_enc_list = [self.critic_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.critic_obs_groups_2d]
+            cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+            # Concatenate to the MLP observations
+            mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
+
+        return self.critic(mlp_obs)  # [batch, num_atoms]
 
     def get_actor_obs(self, obs: TensorDict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         obs_list_1d = [obs[obs_group] for obs_group in self.actor_obs_groups_1d]

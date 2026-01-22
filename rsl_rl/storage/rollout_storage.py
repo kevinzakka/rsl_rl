@@ -46,6 +46,8 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
+        # Distributional critic parameters
+        num_atoms: int = 51,
     ) -> None:
         self.training_type = training_type
         self.device = device
@@ -75,6 +77,9 @@ class RolloutStorage:
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            # Distributional critic target probabilities (C51-style)
+            self.num_atoms = num_atoms
+            self.target_probs = torch.zeros(num_transitions_per_env, num_envs, num_atoms, device=self.device)
 
         # For RNN networks
         self.saved_hidden_state_a = None
@@ -141,6 +146,8 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
+        # Distributional critic target probabilities
+        target_probs = self.target_probs.flatten(0, 1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -158,6 +165,7 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                target_probs_batch = target_probs[batch_idx]
 
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
@@ -178,6 +186,7 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    target_probs_batch,
                 )
 
     # For reinforcement learning with recurrent networks
@@ -209,6 +218,7 @@ class RolloutStorage:
                 advantages_batch = self.advantages[:, start:stop]
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+                target_probs_batch = self.target_probs[:, start:stop]
 
                 # Reshape to [num_envs, time, num layers, hidden dim]
                 # Original shape: [time, num_layers, num_envs, hidden_dim])
@@ -250,6 +260,7 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    target_probs_batch,
                 )
 
                 first_traj = last_traj

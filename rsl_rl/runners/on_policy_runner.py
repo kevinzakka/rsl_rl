@@ -274,7 +274,13 @@ class OnPolicyRunner:
 
         # Initialize the storage
         storage = RolloutStorage(
-            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
+            "rl",
+            self.env.num_envs,
+            self.cfg["num_steps_per_env"],
+            obs,
+            [self.env.num_actions],
+            self.device,
+            num_atoms=actor_critic.num_atoms,
         )
 
         # Initialize the algorithm

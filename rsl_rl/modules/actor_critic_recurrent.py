@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import warnings
 from tensordict import TensorDict
 from torch.distributions import Normal
@@ -34,6 +35,10 @@ class ActorCriticRecurrent(nn.Module):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
+        # Distributional critic parameters (C51-style)
+        num_atoms: int = 51,
+        v_min: float = -10.0,
+        v_max: float = 10.0,
         **kwargs: dict[str, Any],
     ) -> None:
         if "rnn_hidden_size" in kwargs:
@@ -78,11 +83,15 @@ class ActorCriticRecurrent(nn.Module):
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
 
-        # Critic
+        # Distributional critic (C51-style)
+        self.num_atoms = num_atoms
+        self.v_min = v_min
+        self.v_max = v_max
+        self.register_buffer("atoms", torch.linspace(v_min, v_max, num_atoms))
         self.memory_c = Memory(num_critic_obs, rnn_hidden_dim, rnn_num_layers, rnn_type)
-        self.critic = MLP(rnn_hidden_dim, 1, critic_hidden_dims, activation)
+        self.critic = MLP(rnn_hidden_dim, num_atoms, critic_hidden_dims, activation)
         print(f"Critic RNN: {self.memory_c}")
-        print(f"Critic MLP: {self.critic}")
+        print(f"Critic MLP (distributional, {num_atoms} atoms): {self.critic}")
 
         # Critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
@@ -180,10 +189,44 @@ class ActorCriticRecurrent(nn.Module):
     def evaluate(
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
+        """Evaluate the value of the given observation.
+
+        Returns the expected value from the distributional critic: E[Z] = Σ(probs × atoms).
+        This maintains backward compatibility by returning a scalar value.
+
+        Args:
+            obs: The observation tensor dict.
+            masks: Optional masks for the RNN.
+            hidden_state: Optional hidden state for the RNN.
+
+        Returns:
+            The expected value tensor with shape [batch, 1].
+        """
         obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
         out_mem = self.memory_c(obs, masks, hidden_state).squeeze(0)
-        return self.critic(out_mem)
+        logits = self.critic(out_mem)  # [batch, num_atoms]
+        probs = F.softmax(logits, dim=-1)
+        # Expected value: E[Z] = Σ(probs × atoms)
+        return (probs * self.atoms).sum(dim=-1, keepdim=True)  # [batch, 1]
+
+    def evaluate_dist(
+        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
+    ) -> torch.Tensor:
+        """Return the full distribution logits for loss computation.
+
+        Args:
+            obs: The observation tensor dict.
+            masks: Optional masks for the RNN.
+            hidden_state: Optional hidden state for the RNN.
+
+        Returns:
+            The critic logits tensor with shape [batch, num_atoms].
+        """
+        obs = self.get_critic_obs(obs)
+        obs = self.critic_obs_normalizer(obs)
+        out_mem = self.memory_c(obs, masks, hidden_state).squeeze(0)
+        return self.critic(out_mem)  # [batch, num_atoms]
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]
