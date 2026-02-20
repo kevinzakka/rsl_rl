@@ -80,7 +80,10 @@ class MLPModel(nn.Module):
             # Initialize weights and biases for the last layer of the std head
             torch.nn.init.zeros_(self.mlp[-2].weight[output_dim:])  # type: ignore
             if self.noise_std_type == "scalar":
-                torch.nn.init.constant_(self.mlp[-2].bias[output_dim:], init_noise_std)  # type: ignore
+                torch.nn.init.constant_(
+                    self.mlp[-2].bias[output_dim:],
+                    torch.log(torch.exp(torch.tensor(init_noise_std)) - 1.0),  # softplus inverse
+                )  # type: ignore
             elif self.noise_std_type == "log":
                 init_noise_std_log = torch.log(torch.tensor(init_noise_std + 1e-7))
                 torch.nn.init.constant_(self.mlp[-2].bias[output_dim:], init_noise_std_log)  # type: ignore
@@ -89,7 +92,8 @@ class MLPModel(nn.Module):
         elif stochastic:
             # Initialize parameters for state independent std
             if self.noise_std_type == "scalar":
-                self.std = nn.Parameter(init_noise_std * torch.ones(output_dim))
+                softplus_inv = torch.log(torch.exp(torch.tensor(init_noise_std)) - 1.0)
+                self.std = nn.Parameter(softplus_inv * torch.ones(output_dim))
             elif self.noise_std_type == "log":
                 self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(output_dim)))
             else:
@@ -182,6 +186,7 @@ class MLPModel(nn.Module):
             mean_and_std = self.mlp(obs)
             if self.noise_std_type == "scalar":
                 mean, std = torch.unbind(mean_and_std, dim=-2)
+                std = torch.nn.functional.softplus(std) + 1e-6
             elif self.noise_std_type == "log":
                 mean, log_std = torch.unbind(mean_and_std, dim=-2)
                 std = torch.exp(log_std)
@@ -192,7 +197,7 @@ class MLPModel(nn.Module):
             mean = self.mlp(obs)
             # Compute standard deviation
             if self.noise_std_type == "scalar":
-                std = self.std.expand_as(mean)
+                std = torch.nn.functional.softplus(self.std).expand_as(mean) + 1e-6
             elif self.noise_std_type == "log":
                 std = torch.exp(self.log_std).expand_as(mean)
             else:
