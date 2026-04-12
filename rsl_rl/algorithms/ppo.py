@@ -173,8 +173,14 @@ class PPO:
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
+            terminal_observation = extras.get("terminal_observation")
+            if terminal_observation is not None:
+                assert isinstance(terminal_observation, TensorDict)
+                bootstrap_values = self.critic(terminal_observation).detach()
+            else:
+                bootstrap_values = self.transition.values
             self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device),  # type: ignore
+                bootstrap_values * extras["time_outs"].unsqueeze(1).to(self.device),  # type: ignore
                 1,
             )
 

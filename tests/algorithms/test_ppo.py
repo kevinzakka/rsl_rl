@@ -224,6 +224,49 @@ class TestTimeoutBootstrapping:
         stored_reward_env1 = ppo.storage.rewards[0, 1, 0].item()
         assert abs(stored_reward_env1 - 1.0) < 1e-5
 
+    def test_timeout_prefers_terminal_observation_when_available(self) -> None:
+        """Timeout bootstrap should use the critic value of the terminal observation."""
+        ppo, obs = _build_ppo()
+
+        ppo.act(obs)
+        stored_values = ppo.transition.values.clone()
+
+        terminal_obs = obs.clone()
+        terminal_obs["policy"] = torch.full_like(terminal_obs["policy"], 123.0)
+        raw_reward = torch.ones(NUM_ENVS)
+        dones = torch.ones(NUM_ENVS)
+        time_outs = torch.zeros(NUM_ENVS)
+        time_outs[0] = 1.0
+
+        original_critic_forward = ppo.critic.forward
+
+        def critic_forward(td, *args, **kwargs):
+            policy = td["policy"]
+            value = torch.full((policy.shape[0], 1), 7.0, device=policy.device)
+            value[policy[:, 0] != 123.0] = 3.0
+            return value
+
+        ppo.critic.forward = critic_forward
+        try:
+            ppo.process_env_step(
+                obs,
+                raw_reward,
+                dones,
+                {
+                    "time_outs": time_outs,
+                    "terminal_observation": terminal_obs,
+                },
+            )
+        finally:
+            ppo.critic.forward = original_critic_forward
+
+        stored_reward_env0 = ppo.storage.rewards[0, 0, 0].item()
+        expected = 1.0 + ppo.gamma * 7.0
+        assert abs(stored_reward_env0 - expected) < 1e-5
+
+        fallback = 1.0 + ppo.gamma * stored_values[0, 0].item()
+        assert abs(stored_reward_env0 - fallback) > 1e-4
+
 
 class TestPPOLosses:
     """Tests for PPO loss computation correctness."""
